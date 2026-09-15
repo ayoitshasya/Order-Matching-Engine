@@ -182,6 +182,17 @@ a raw listener to an `OrderBook`; it wraps every listener in an `AsyncTradeListe
 by its own single-thread executor, so the writer thread's call to the listener only has to
 enqueue a task and return. A slow or broken listener can only ever delay itself.
 
+**Ordering guarantee.** A listener always sees one symbol's trades and status changes — direct
+and cascaded alike — in the exact order that symbol's writer thread produced them: every event
+for a symbol comes from that symbol's single writer thread, and a single-thread executor's FIFO
+queue always preserves one caller's own submission order. There is no equivalent guarantee
+*across* symbols. `MatchingEngine.addListener` registers the same listener on every symbol's
+book, so a listener watching several symbols has its events enqueued by several independent,
+unsynchronized writer threads with no shared clock or sequence between them — it can observe
+trades from different symbols in an order that has nothing to do with when they were actually
+matched. (`Trade.sequence` cannot rescue this either: it is assigned per `OrderBook`, so it only
+orders trades within one symbol, not across them.)
+
 ### Graceful shutdown
 
 `MatchingEngine.shutdown()` stops accepting new commands, lets every symbol's queue drain to
