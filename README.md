@@ -1,8 +1,44 @@
 # Order Matching Engine
 
-A price-time priority order matching engine for a single exchange, built in Java to
-demonstrate core Java, object-oriented design, and concurrency skills. Code quality, clean
-design, and test coverage are the priority here, not raw throughput.
+A price-time priority order matching engine for a single exchange, built in Java to demonstrate
+core Java, object-oriented design, and concurrency skills. It accepts orders (limit, market, and
+stop/stop-limit), matches them against a resting order book by price then arrival time, and
+reports every resulting trade and status change to whoever is listening — single-threaded and
+in-process at its core, wrapped in a multithreaded engine that runs one symbol's matching
+independently of every other symbol's. Code quality, clean design, and test coverage are the
+priority here, not raw throughput; the [Benchmarks](#benchmarks) section measures the throughput
+and latency that design actually delivers rather than assuming it.
+
+167 tests, 97% instruction / 94% branch coverage. See [Design Decisions](#design-decisions) for
+the *why* behind the choices below, and [What Is Not Built](#what-is-not-built) for the
+deliberate edges of the project's scope.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    Caller(["Caller"]) -->|"placeOrder / cancelOrder / ..."| Router
+
+    subgraph Engine["MatchingEngine — one queue + writer thread + OrderBook per symbol"]
+        Router["router"] --> Queue[["command queue"]]
+        Queue --> Writer(("writer thread"))
+        Writer --> Book["OrderBook"]
+        Writer -.->|"logs command"| Log[("event log")]
+    end
+
+    Book -->|"trade / status event"| Async["AsyncTradeListener<br/>(own thread)"]
+    Async --> Listener(["caller's TradeListener"])
+    Writer -.->|"CompletableFuture"| Caller
+```
+
+A caller never touches an `OrderBook` directly. `MatchingEngine` routes each command to the
+queue for its order's symbol; that symbol's own writer thread — and only that thread — drains
+the queue, mutates the `OrderBook`, optionally appends the command to an event log, and completes
+a `CompletableFuture` back to the caller. Trade and status events go out through a listener
+wrapper that runs on its own thread, so a slow listener can never stall matching. Every symbol
+gets this whole pipeline to itself: `AAPL` and `MSFT` match concurrently on independent threads
+with no shared mutable state between them. See [Concurrency Design](#concurrency-design-phase-4)
+for the full reasoning and the races this design had to close.
 
 ## Tech Stack
 
@@ -11,7 +47,6 @@ design, and test coverage are the priority here, not raw throughput.
 - JUnit 5 and AssertJ for testing
 - JaCoCo for coverage reporting
 - JMH for benchmarking
-- Spring Boot 3, WebSocket, and PostgreSQL (added in a later phase)
 
 ## Modules
 
@@ -20,10 +55,8 @@ design, and test coverage are the priority here, not raw throughput.
   and AssertJ are test-only dependencies.
 - `engine-bench` — JMH benchmarks for `OrderBook` and `MatchingEngine`. See
   [Benchmarks](#benchmarks) below for how to run them and the last measured numbers.
-- `exchange-service` — a Spring Boot service exposing the engine over REST and WebSocket,
-  backed by PostgreSQL (added in a later phase).
 
-## Building and Testing
+## Building, Testing, and Running the Demo
 
 ```bash
 mvn verify
@@ -31,6 +64,17 @@ mvn verify
 
 This compiles all modules, runs the test suite, and generates a JaCoCo coverage report at
 `engine-core/target/site/jacoco/index.html`.
+
+To see the engine work without writing any code, run the narrated demo — it places a realistic
+sequence of orders on one symbol (resting orders on both sides, a partial fill, a market order, a
+stop that gets triggered) and prints every trade, status change, and the final book state:
+
+```bash
+mvn -pl engine-core compile exec:java -Dexec.mainClass=com.ayoitshasya.matching.core.demo.MatchingEngineDemo
+```
+
+`MatchingEngineDemo`'s own Javadoc walks through exactly what it submits and why, if you want to
+follow along in the source rather than just the output.
 
 ## Design Decisions
 
@@ -421,3 +465,35 @@ the return type) still passes. Given a change that is mechanically an allocation
 no downside and no added complexity worth worrying about, keeping it does not require the
 throughput benchmark to have proven a large win — only that it didn't show a loss, which it
 didn't.
+
+## What Is Not Built
+
+Everything below is a deliberate scope boundary, not a gap left by running out of time — each
+one was cut to keep the project focused on core Java, OOP, and concurrency design, which is what
+it set out to demonstrate.
+
+- **No REST, WebSocket, or any network API.** The engine is a Java library, driven by direct
+  calls to `MatchingEngine`'s public methods — see the [Demo](#building-testing-and-running-the-demo)
+  for exactly what that looks like. Exposing it over HTTP is a separate concern (a web framework,
+  request/response mapping, an API contract to version) layered on top of, not mixed into, the
+  matching logic itself.
+- **No database or persistent storage.** Book state lives in memory only. The event log (see
+  [Event Log and Replay](#event-log-and-replay-phase-5)) is an append-only replay mechanism for
+  rebuilding that in-memory state, not a queryable store — there is no schema, no indexing, no
+  querying trades by anything other than replaying the whole log in order.
+- **No authentication, authorization, or multi-tenant isolation.** Any caller with a Java
+  reference to a `MatchingEngine` can place or cancel any order on any symbol. There is no
+  concept of an account or a user the engine is aware of.
+- **No risk checks.** Orders are accepted on structural validity alone (positive price and
+  quantity, a real order ID) — never against an account balance, a position limit, or any other
+  business rule. A real exchange's pre-trade risk checks are a distinct responsibility from
+  matching and were kept out to keep that boundary clean.
+- **No order types beyond limit, market, stop, and stop-limit.** No iceberg orders, no
+  time-in-force beyond a limit order resting until filled or cancelled (no IOC, FOK, or GTD), no
+  self-trade prevention.
+- **Single process, no clustering.** `MatchingEngine`'s per-symbol parallelism is threads within
+  one JVM, not processes or machines — no sharding a symbol's book across nodes, no leader
+  election, no distributed consensus. A real exchange operating at a scale where one machine
+  can't hold every symbol's book would need that; this one doesn't attempt it.
+- **No containerization or CI/CD pipeline.** No Dockerfile, no Kubernetes manifests, no GitHub
+  Actions workflow. `mvn verify` is the entire build and test story, run locally.

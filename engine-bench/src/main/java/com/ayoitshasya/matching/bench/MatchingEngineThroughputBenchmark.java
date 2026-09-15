@@ -42,6 +42,7 @@ public class MatchingEngineThroughputBenchmark {
     private static final int SYMBOL_THREADS = 4;
     private static final long SELL_PRICE_BASE = 2_000_000_000L;
 
+    /** One engine shared by every thread in the benchmark — the thing actually under test. */
     @State(Scope.Benchmark)
     public static class EngineState {
 
