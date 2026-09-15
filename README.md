@@ -70,9 +70,9 @@ gives deterministic, reproducible ordering — which also makes the event log re
 
 `Order` is an abstract class holding only what every order type has in common (identity,
 symbol, side, quantity, sequence, status). Order-type-specific data, such as a limit price,
-lives on the concrete subclass (`LimitOrder`). This keeps the base class stable: market and
-stop orders (added in a later phase) are new subclasses, not new fields and branches bolted
-onto an existing class or a growing `switch` on a type enum.
+lives on the concrete subclass (`LimitOrder`). This kept the base class stable when market and
+stop orders were added later: they are new subclasses, not new fields and branches bolted onto
+an existing class or a growing `switch` on a type enum.
 
 ### Encapsulated state transitions
 
@@ -82,3 +82,65 @@ transition (a filled order cannot be cancelled, a fill cannot exceed the remaini
 and so on) and throws `InvalidOrderException` with a clear message otherwise. This makes
 invalid states unrepresentable through the public API rather than merely discouraged by
 convention.
+
+### Polymorphic matching: no `instanceof`, no `switch` on order type
+
+`OrderBook.submit` accepts a `TradableOrder` — an abstract layer between `Order` and the
+concrete `LimitOrder`/`MarketOrder` types — and never asks what concrete type it was given.
+Two abstract methods carry all of the type-specific behavior:
+
+- `crosses(long oppositePrice)` — whether this order can trade against a given opposite best
+  price. A limit order compares its own price; a market order always returns `true`.
+- `applyUnfilledRemainder(UnfilledRemainderHandler)` — what happens to whatever is left after
+  matching stops. This is a double dispatch, not a type check: `LimitOrder` calls
+  `handler.rest(this)`, and `MarketOrder` calls `handler.cancelRemainder(this)`. Because
+  `rest` is typed to accept only a `LimitOrder`, the compiler — not a runtime check —
+  guarantees that only a resting-capable order can ever enter a price level or the
+  cancellation index. `MarketOrder`'s class name does not appear anywhere in `OrderBook`.
+
+Adding a new tradable order type later means implementing these two methods on a new
+`TradableOrder` subclass; `OrderBook` does not change.
+
+### `StopOrder` lives outside the matching hierarchy entirely
+
+A stop order is never matched directly, so it does not extend `TradableOrder` — it has no
+crossing rule and no unfilled remainder, because it is never submitted to the matching loop
+in the first place. It waits in a separate pending stop book (a `TreeMap<Long, PriceLevel<StopOrder>>`
+per side, reusing the same generic `PriceLevel` that backs the visible book, since "orders
+waiting at a price, in arrival order" is the same shape either way).
+
+A buy stop triggers when the last trade price rises to or above its stop price; a sell stop
+when it falls to or below. Once triggered, it produces (`StopOrder.trigger`) the order that
+actually enters the book: a `MarketOrder` for a plain stop, or a `LimitOrder` at its limit
+price for a stop-limit — carrying the same order ID forward, since it's a continuation of the
+same order's lifecycle, not a new one.
+
+**Cascades.** Triggering a stop can produce a trade, which can trigger another stop, which can
+produce another trade. `OrderBook.processTriggeredStops()` handles this with a loop, not
+recursion: after any order's own matching finishes, it repeatedly polls "is there a pending
+stop the current last trade price would trigger?", processes it, and polls again, until
+nothing triggers. A cascade of any length is handled by iteration.
+
+This checks for triggers once per top-level `submit`, after that order's matching has fully
+run — not after every individual trade inside a multi-level sweep. A stop that would have
+triggered partway through a large sweep still triggers, just once the sweep (or the cascade
+step that produced it) finishes rather than interleaved mid-sweep. Real venues interleave more
+tightly; this is a deliberate simplification, made because fully interleaved triggering adds
+real complexity for a case (a stop firing mid-sweep of a single aggressive order) that doesn't
+change the eventual outcome, only its timing within one already-atomic operation.
+
+Cascaded trades are delivered to `TradeListener`s but are not included in the `List<Trade>`
+that the original `submit` call returns — the caller asked to place one order, not to receive
+every downstream consequence of doing so. Listeners are the mechanism for observing everything
+that happens, direct or cascaded; the return value is just a receipt for the one order.
+
+### Observer pattern for trades and status changes, with listener isolation
+
+`OrderBook` notifies registered `TradeListener`s of every trade and every order status
+transition. A listener is an observer, not a participant in matching: `OrderBook` catches
+`RuntimeException` around each individual listener call, so a broken market-data feed or
+metrics hook can neither corrupt a trade nor prevent other listeners from being notified nor
+abort matching itself. The alternative — letting a listener exception propagate — would mean
+a bug in, say, a WebSocket broadcaster could leave an order half-matched and the book in an
+inconsistent state, which is a far worse outcome than that one listener silently missing an
+update.
