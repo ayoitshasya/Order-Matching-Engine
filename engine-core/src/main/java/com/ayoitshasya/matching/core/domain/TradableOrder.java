@@ -10,8 +10,11 @@ package com.ayoitshasya.matching.core.domain;
  * It waits in a separate pending-stop structure and, once triggered, spawns a
  * {@code TradableOrder} (a {@link MarketOrder}, or a {@link LimitOrder} for a stop-limit) that
  * is submitted for matching in its place.
+ *
+ * <p>Sealed to exactly these two permitted subclasses: the set of order types the book can match
+ * directly is a deliberately closed set, not one third parties extend.
  */
-public abstract class TradableOrder extends Order {
+public abstract sealed class TradableOrder extends Order permits LimitOrder, MarketOrder {
 
     protected TradableOrder(long id, String symbol, Side side, long quantity, long sequence) {
         super(id, symbol, side, quantity, sequence);
