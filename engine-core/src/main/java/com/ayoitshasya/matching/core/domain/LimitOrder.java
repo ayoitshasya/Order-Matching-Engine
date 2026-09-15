@@ -11,7 +11,7 @@ import com.ayoitshasya.matching.core.exception.InvalidOrderException;
  * costly to allocate and compare on the matching hot path. Conversion to and from a
  * human-readable decimal value happens only at the API boundary.
  */
-public final class LimitOrder extends Order {
+public final class LimitOrder extends TradableOrder {
 
     private final long price;
 
@@ -25,6 +25,16 @@ public final class LimitOrder extends Order {
 
     public long getPrice() {
         return price;
+    }
+
+    @Override
+    public boolean crosses(long oppositeBestPrice) {
+        return getSide() == Side.BUY ? price >= oppositeBestPrice : price <= oppositeBestPrice;
+    }
+
+    @Override
+    public void applyUnfilledRemainder(UnfilledRemainderHandler handler) {
+        handler.rest(this);
     }
 
     @Override

@@ -147,6 +147,27 @@ public abstract class Order {
         return !status.isTerminal();
     }
 
+    /**
+     * Moves this order directly to a terminal status outside the fill/cancel/reject
+     * lifecycle. Used by order types with their own terminal outcome that isn't a fill, a
+     * cancel, or a rejection — for example a stop order moving to
+     * {@link OrderStatus#TRIGGERED} once its condition is met.
+     *
+     * @throws InvalidOrderException if the order is already in a terminal status, or if
+     *                                 {@code terminalStatus} is not itself terminal
+     */
+    protected final void moveToTerminalStatus(OrderStatus terminalStatus) {
+        if (status.isTerminal()) {
+            throw new InvalidOrderException(
+                    "Cannot change status of order " + id + " from terminal status " + status);
+        }
+        if (!terminalStatus.isTerminal()) {
+            throw new InvalidOrderException(
+                    "moveToTerminalStatus requires a terminal status, got " + terminalStatus);
+        }
+        status = terminalStatus;
+    }
+
     @Override
     public boolean equals(Object o) {
         if (this == o) {
