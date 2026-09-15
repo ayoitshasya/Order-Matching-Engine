@@ -20,6 +20,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.OptionalLong;
 import java.util.TreeMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 
 /**
  * A single-symbol order book, matching incoming orders against resting ones under price-time
@@ -39,8 +40,11 @@ import java.util.TreeMap;
  * they wait in a separate pending-stop structure (see {@link #submitStop}) until triggered.
  *
  * <p>{@code ordersById} gives O(1) lookup for cancellation without a linear scan of price
- * levels. This class is not thread-safe; a later phase confines all mutation of one symbol's
- * book to a single writer thread rather than adding locking here.
+ * levels. This class is not thread-safe for matching: {@code MatchingEngine} confines all order
+ * and cancellation traffic for one symbol to a single writer thread rather than adding locking
+ * here. Listener registration is the one operation that can legitimately happen from a different
+ * thread (a caller registering interest in a symbol's book at any time), so {@link #listeners} is
+ * a {@code CopyOnWriteArrayList} rather than a plain list.
  */
 public final class OrderBook {
 
@@ -56,7 +60,10 @@ public final class OrderBook {
     private final TreeMap<Long, PriceLevel<StopOrder>> pendingSellStops = new TreeMap<>(Comparator.reverseOrder());
     private final Map<Long, StopOrder> stopOrdersById = new HashMap<>();
 
-    private final List<TradeListener> listeners = new ArrayList<>();
+    // A CopyOnWriteArrayList, not an ArrayList: registration can happen from a thread other than
+    // this book's writer thread (see MatchingEngine), concurrently with that writer thread
+    // iterating this list mid-trade. See NOTES-CONCURRENCY.md.
+    private final List<TradeListener> listeners = new CopyOnWriteArrayList<>();
 
     /** Disposes of a TradableOrder's unfilled remainder without OrderBook exposing that as public API. */
     private final UnfilledRemainderHandler remainderHandler = new UnfilledRemainderHandler() {
@@ -88,8 +95,17 @@ public final class OrderBook {
         return symbol;
     }
 
+    /**
+     * Registers {@code listener} to receive every trade and status change from this book.
+     * Registering the same listener instance twice is a no-op, rather than delivering every
+     * event to it twice: a caller that registers the same listener against a book it does not
+     * yet know exists (see {@code MatchingEngine.addListener}) can safely do so without checking
+     * first.
+     */
     public void addListener(TradeListener listener) {
-        listeners.add(listener);
+        if (!listeners.contains(listener)) {
+            listeners.add(listener);
+        }
     }
 
     /**

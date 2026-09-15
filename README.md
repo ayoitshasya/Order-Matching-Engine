@@ -144,3 +144,49 @@ abort matching itself. The alternative — letting a listener exception propagat
 a bug in, say, a WebSocket broadcaster could leave an order half-matched and the book in an
 inconsistent state, which is a far worse outcome than that one listener silently missing an
 update.
+
+## Concurrency Design (Phase 4)
+
+`MatchingEngine` is the multithreaded entry point: one `OrderBook` per symbol, each owned by
+exactly one writer thread, so `OrderBook` itself never needs a lock (see above — it stays
+built for a single mutator, as originally designed).
+
+### One writer thread per symbol, fed by a queue
+
+Each symbol gets a `SymbolWorker`: an `OrderBook`, a `BlockingQueue` of commands, and a single
+dedicated thread that takes commands off that queue and runs them against the book, one at a
+time, in arrival order. Because exactly one thread ever touches a given symbol's book, there
+is nothing to lock there — the concurrency safety of the whole engine reduces to "does a
+command ever reach the wrong book, or reach the right book more than once, or get lost." Two
+symbols are entirely independent: `AAPL` and `MSFT` match concurrently on two different
+threads with no shared mutable state between them at all.
+
+### Commands and futures, not direct method calls
+
+A caller never touches an `OrderBook`. `MatchingEngine` exposes `placeOrder`,
+`placeStopOrder`, `cancelOrder`, and `cancelStopOrder`, each of which builds a `Command`
+(a sealed interface of four records: `PlaceOrder`, `PlaceStopOrder`, `CancelOrder`,
+`CancelStopOrder`), hands it to the owning symbol's worker, and returns a
+`CompletableFuture` that the writer thread completes once it has actually run that command —
+normally with the result, exceptionally if the command threw. A command throwing
+(`InvalidOrderException`, `OrderNotFoundException`) never kills its writer thread: only that
+one command's future is affected, and the thread loops back for its next command. See
+NOTES-CONCURRENCY.md for why this matters and how it is guaranteed.
+
+### Listener notifications are decoupled from the writer thread
+
+`OrderBook` still calls its listeners synchronously and inline with matching, by design (see
+above). But a listener that runs slowly would stall whichever writer thread called it,
+backing up that entire symbol's queue behind one slow observer. `MatchingEngine` never gives
+a raw listener to an `OrderBook`; it wraps every listener in an `AsyncTradeListener`, backed
+by its own single-thread executor, so the writer thread's call to the listener only has to
+enqueue a task and return. A slow or broken listener can only ever delay itself.
+
+### Graceful shutdown
+
+`MatchingEngine.shutdown()` stops accepting new commands, lets every symbol's queue drain to
+whatever was already in it, joins every writer thread, then closes every listener's executor.
+A command submitted after shutdown has started fails its future immediately with
+`EngineShutdownException` rather than hanging — there is no window where a command is
+accepted but never actually run. See NOTES-CONCURRENCY.md for the races this had to close to
+be true.
