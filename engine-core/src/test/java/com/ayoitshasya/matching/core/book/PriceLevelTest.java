@@ -18,7 +18,7 @@ class PriceLevelTest {
 
     @Test
     void startsEmpty() {
-        PriceLevel level = new PriceLevel(15_000);
+        PriceLevel<LimitOrder> level = new PriceLevel<>(15_000);
 
         assertThat(level.isEmpty()).isTrue();
         assertThat(level.getOrderCount()).isZero();
@@ -28,7 +28,7 @@ class PriceLevelTest {
 
     @Test
     void addOrderIncreasesCountAndTotalQuantity() {
-        PriceLevel level = new PriceLevel(15_000);
+        PriceLevel<LimitOrder> level = new PriceLevel<>(15_000);
 
         level.addOrder(order(1, 100, 0));
         level.addOrder(order(2, 50, 1));
@@ -40,7 +40,7 @@ class PriceLevelTest {
 
     @Test
     void ordersAreReturnedInFifoInsertionOrder() {
-        PriceLevel level = new PriceLevel(15_000);
+        PriceLevel<LimitOrder> level = new PriceLevel<>(15_000);
         LimitOrder first = order(1, 100, 0);
         LimitOrder second = order(2, 50, 1);
         LimitOrder third = order(3, 25, 2);
@@ -54,7 +54,7 @@ class PriceLevelTest {
 
     @Test
     void ordersViewIsUnmodifiable() {
-        PriceLevel level = new PriceLevel(15_000);
+        PriceLevel<LimitOrder> level = new PriceLevel<>(15_000);
         level.addOrder(order(1, 100, 0));
 
         List<LimitOrder> view = List.copyOf(level.orders());
@@ -65,7 +65,7 @@ class PriceLevelTest {
 
     @Test
     void removeOrderReturnsRemovedOrderAndReducesTotalQuantity() {
-        PriceLevel level = new PriceLevel(15_000);
+        PriceLevel<LimitOrder> level = new PriceLevel<>(15_000);
         LimitOrder removable = order(1, 100, 0);
         level.addOrder(removable);
         level.addOrder(order(2, 50, 1));
@@ -79,7 +79,7 @@ class PriceLevelTest {
 
     @Test
     void removeOrderReturnsNullWhenOrderNotPresent() {
-        PriceLevel level = new PriceLevel(15_000);
+        PriceLevel<LimitOrder> level = new PriceLevel<>(15_000);
         level.addOrder(order(1, 100, 0));
 
         LimitOrder removed = level.removeOrder(999);
@@ -91,7 +91,7 @@ class PriceLevelTest {
 
     @Test
     void recordFillReducesTotalQuantityWithoutRemovingOrders() {
-        PriceLevel level = new PriceLevel(15_000);
+        PriceLevel<LimitOrder> level = new PriceLevel<>(15_000);
         level.addOrder(order(1, 100, 0));
 
         level.recordFill(40);
@@ -102,7 +102,7 @@ class PriceLevelTest {
 
     @Test
     void iteratorSupportsRemovalDuringTraversal() {
-        PriceLevel level = new PriceLevel(15_000);
+        PriceLevel<LimitOrder> level = new PriceLevel<>(15_000);
         LimitOrder first = order(1, 100, 0);
         LimitOrder second = order(2, 50, 1);
         level.addOrder(first);

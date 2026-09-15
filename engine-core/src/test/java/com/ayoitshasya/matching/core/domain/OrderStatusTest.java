@@ -8,7 +8,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 class OrderStatusTest {
 
     @ParameterizedTest
-    @EnumSource(value = OrderStatus.class, names = {"FILLED", "CANCELLED", "REJECTED"})
+    @EnumSource(value = OrderStatus.class, names = {"FILLED", "CANCELLED", "REJECTED", "TRIGGERED"})
     void terminalStatusesReportAsTerminal(OrderStatus status) {
         assertThat(status.isTerminal()).isTrue();
     }

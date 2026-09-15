@@ -5,10 +5,50 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import java.util.ArrayList;
+import java.util.List;
+
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class LimitOrderTest {
+
+    @Test
+    void crossesUsesSideSpecificComparison() {
+        LimitOrder buy = new LimitOrder(1, "AAPL", Side.BUY, 100, 15_000, 0);
+        LimitOrder sell = new LimitOrder(2, "AAPL", Side.SELL, 100, 15_000, 0);
+
+        assertThat(buy.crosses(15_000)).isTrue();
+        assertThat(buy.crosses(15_001)).isFalse();
+        assertThat(sell.crosses(15_000)).isTrue();
+        assertThat(sell.crosses(14_999)).isFalse();
+    }
+
+    @Test
+    void applyUnfilledRemainderDelegatesToRest() {
+        LimitOrder order = new LimitOrder(1, "AAPL", Side.BUY, 100, 15_000, 0);
+        RecordingHandler handler = new RecordingHandler();
+
+        order.applyUnfilledRemainder(handler);
+
+        assertThat(handler.restedOrders).containsExactly(order);
+        assertThat(handler.cancelledOrders).isEmpty();
+    }
+
+    private static final class RecordingHandler implements UnfilledRemainderHandler {
+        private final List<LimitOrder> restedOrders = new ArrayList<>();
+        private final List<TradableOrder> cancelledOrders = new ArrayList<>();
+
+        @Override
+        public void rest(LimitOrder order) {
+            restedOrders.add(order);
+        }
+
+        @Override
+        public void cancelRemainder(TradableOrder order) {
+            cancelledOrders.add(order);
+        }
+    }
 
     @Test
     void constructsWithNewStatusAndFullRemainingQuantity() {
