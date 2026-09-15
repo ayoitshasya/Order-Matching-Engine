@@ -1,18 +1,23 @@
 package com.ayoitshasya.matching.core.engine;
 
 import com.ayoitshasya.matching.core.book.OrderBook;
+import com.ayoitshasya.matching.core.book.PendingStopView;
+import com.ayoitshasya.matching.core.book.RestingOrderView;
 import com.ayoitshasya.matching.core.domain.StopOrder;
 import com.ayoitshasya.matching.core.domain.TradableOrder;
 import com.ayoitshasya.matching.core.domain.Trade;
 import com.ayoitshasya.matching.core.event.TradeListener;
 import com.ayoitshasya.matching.core.exception.EngineShutdownException;
+import com.ayoitshasya.matching.core.eventlog.EventLogWriter;
 
 import java.util.List;
 import java.util.Map;
+import java.util.OptionalLong;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.function.Function;
 
 /**
  * A multithreaded matching engine: one {@link OrderBook} per symbol, each owned by exactly one
@@ -32,16 +37,31 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
  * writer thread that produced the event. See that class for why.
  *
  * <p>{@link #shutdown()} stops accepting new commands, lets every symbol's queue drain to
- * completion, joins every writer thread, then closes every listener's executor. A command
- * submitted after shutdown has started fails its future immediately with
- * {@link EngineShutdownException} rather than hanging.
+ * completion, joins every writer thread, then closes every listener's executor (and the event
+ * log, if one is configured). A command submitted after shutdown has started fails its future
+ * immediately with {@link EngineShutdownException} rather than hanging.
+ *
+ * <p>If constructed with an {@link EventLogWriter}, every accepted command is appended to it from
+ * inside the owning symbol's writer thread, in exactly the order that thread processes commands —
+ * see {@link EventLogWriter} for why that placement matters and how it stays off the hot path.
  */
 public final class MatchingEngine {
 
     private final Map<String, SymbolWorker> workers = new ConcurrentHashMap<>();
     private final List<AsyncTradeListener> listeners = new CopyOnWriteArrayList<>();
     private final ReentrantReadWriteLock lifecycle = new ReentrantReadWriteLock();
+    private final EventLogWriter eventLog;
     private volatile boolean shuttingDown = false;
+
+    /** An engine that does not log the commands it processes. */
+    public MatchingEngine() {
+        this(null);
+    }
+
+    /** An engine that appends every accepted command to {@code eventLog} as it is processed. */
+    public MatchingEngine(EventLogWriter eventLog) {
+        this.eventLog = eventLog;
+    }
 
     /** Submits an order for immediate matching against its symbol's book. */
     public CompletableFuture<List<Trade>> placeOrder(TradableOrder order) {
@@ -64,6 +84,24 @@ public final class MatchingEngine {
     }
 
     /**
+     * @return every resting order in {@code symbol}'s book, in book order — see
+     *         {@link OrderBook#restingOrders()}
+     */
+    public CompletableFuture<List<RestingOrderView>> restingOrders(String symbol) {
+        return query(symbol, OrderBook::restingOrders);
+    }
+
+    /** @return every pending stop in {@code symbol}'s book — see {@link OrderBook#pendingStops()} */
+    public CompletableFuture<List<PendingStopView>> pendingStops(String symbol) {
+        return query(symbol, OrderBook::pendingStops);
+    }
+
+    /** @return {@code symbol}'s most recent trade price, or empty if it has never traded */
+    public CompletableFuture<OptionalLong> lastTradePrice(String symbol) {
+        return query(symbol, OrderBook::lastTradePrice);
+    }
+
+    /**
      * Registers a listener across every symbol this engine trades: existing symbols immediately,
      * and any symbol whose first command arrives later. The listener is wrapped in an
      * {@link AsyncTradeListener} so it runs on its own dedicated thread rather than the caller's
@@ -79,8 +117,8 @@ public final class MatchingEngine {
 
     /**
      * Stops accepting new commands, waits for every symbol's queue to fully drain, joins every
-     * writer thread, then closes every listener's executor. Idempotent: a second call returns
-     * immediately.
+     * writer thread, then closes every listener's executor and the event log (if configured).
+     * Idempotent: a second call returns immediately.
      */
     public void shutdown() {
         lifecycle.writeLock().lock();
@@ -106,6 +144,9 @@ public final class MatchingEngine {
         for (AsyncTradeListener listener : listeners) {
             listener.close();
         }
+        if (eventLog != null) {
+            eventLog.close();
+        }
     }
 
     /**
@@ -119,16 +160,33 @@ public final class MatchingEngine {
      * future that never completes. See NOTES-CONCURRENCY.md.
      */
     private <T> CompletableFuture<T> submit(Command<T> command) {
+        return enqueue(command.symbol(), future -> new SymbolWorker.Task<>(command, future));
+    }
+
+    /**
+     * Runs a read-only {@code reader} against {@code symbol}'s book, on that symbol's own writer
+     * thread, so it can never race a concurrent mutation. Unlike {@link #submit}, nothing here is
+     * appended to the event log: a query does not change state, so there is nothing to replay.
+     * Private: callers only ever see the typed public methods above ({@link #restingOrders}, and
+     * so on), never a raw function over an {@code OrderBook} — {@code MatchingEngine} still never
+     * exposes {@code OrderBook} itself to a caller.
+     */
+    private <T> CompletableFuture<T> query(String symbol, Function<OrderBook, T> reader) {
+        return enqueue(symbol, future -> new SymbolWorker.QueryTask<>(reader, future));
+    }
+
+    private <T> CompletableFuture<T> enqueue(
+            String symbol, Function<CompletableFuture<T>, SymbolWorker.WorkItem> workItemFactory) {
         lifecycle.readLock().lock();
         try {
             CompletableFuture<T> future = new CompletableFuture<>();
             if (shuttingDown) {
                 future.completeExceptionally(
-                        new EngineShutdownException("Engine is shutting down; rejected " + command));
+                        new EngineShutdownException("Engine is shutting down; rejected a request for " + symbol));
                 return future;
             }
-            SymbolWorker worker = workers.computeIfAbsent(command.symbol(), this::newWorker);
-            worker.offer(new SymbolWorker.Task<>(command, future));
+            SymbolWorker worker = workers.computeIfAbsent(symbol, this::newWorker);
+            worker.offer(workItemFactory.apply(future));
             return future;
         } finally {
             lifecycle.readLock().unlock();
@@ -136,6 +194,6 @@ public final class MatchingEngine {
     }
 
     private SymbolWorker newWorker(String symbol) {
-        return new SymbolWorker(symbol, listeners);
+        return new SymbolWorker(symbol, listeners, eventLog);
     }
 }

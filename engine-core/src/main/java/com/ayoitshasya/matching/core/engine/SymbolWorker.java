@@ -2,10 +2,12 @@ package com.ayoitshasya.matching.core.engine;
 
 import com.ayoitshasya.matching.core.book.OrderBook;
 import com.ayoitshasya.matching.core.event.TradeListener;
+import com.ayoitshasya.matching.core.eventlog.EventLogWriter;
 
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.function.Function;
 
 /**
  * Owns exactly one {@link OrderBook} and the single thread allowed to mutate it. Every
@@ -13,6 +15,13 @@ import java.util.concurrent.LinkedBlockingQueue;
  * order by that one thread — the design that lets {@code OrderBook} itself stay lock-free (see
  * its class-level docs): no second thread ever observes or mutates the book concurrently with
  * the writer.
+ *
+ * <p>Two kinds of {@link WorkItem} flow through the same queue: a {@link Task} carries a
+ * mutating {@link Command} and is appended to the event log (if one is configured) as it is
+ * dequeued, in exactly the order it is about to run; a {@link QueryTask} carries a read-only
+ * function over the book (used by {@code MatchingEngine}'s introspection methods) and is never
+ * logged, since replaying a read would be meaningless. Both still run on this one thread, so a
+ * query never races a concurrent mutation.
  *
  * <p>{@link #offer} and {@link #shutdown} are both {@code synchronized} on this instance so that
  * "add a task to the queue" and "close the queue" can never interleave: once {@link #shutdown}
@@ -22,15 +31,17 @@ import java.util.concurrent.LinkedBlockingQueue;
  */
 final class SymbolWorker {
 
-    private static final Task<?> POISON_PILL = new Task<Void>(null, null);
+    private static final WorkItem POISON_PILL = new Task<Void>(null, null);
 
     private final OrderBook book;
-    private final LinkedBlockingQueue<Task<?>> queue = new LinkedBlockingQueue<>();
+    private final EventLogWriter eventLog;
+    private final LinkedBlockingQueue<WorkItem> queue = new LinkedBlockingQueue<>();
     private final Thread thread;
     private boolean closed = false;
 
-    SymbolWorker(String symbol, List<? extends TradeListener> initialListeners) {
+    SymbolWorker(String symbol, List<? extends TradeListener> initialListeners, EventLogWriter eventLog) {
         this.book = new OrderBook(symbol);
+        this.eventLog = eventLog;
         initialListeners.forEach(book::addListener);
         this.thread = new Thread(this::run, "matching-writer-" + symbol);
         this.thread.setDaemon(true);
@@ -42,11 +53,11 @@ final class SymbolWorker {
     }
 
     /** @return false if this worker has already been asked to shut down */
-    synchronized boolean offer(Task<?> task) {
+    synchronized boolean offer(WorkItem item) {
         if (closed) {
             return false;
         }
-        queue.add(task);
+        queue.add(item);
         return true;
     }
 
@@ -64,18 +75,30 @@ final class SymbolWorker {
 
     private void run() {
         while (true) {
-            Task<?> task;
+            WorkItem item;
             try {
-                task = queue.take();
+                item = queue.take();
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 return;
             }
-            if (task == POISON_PILL) {
+            if (item == POISON_PILL) {
                 return;
             }
-            task.runOn(book);
+            switch (item) {
+                case Task<?> task -> {
+                    if (eventLog != null) {
+                        eventLog.append(task.command());
+                    }
+                    task.runOn(book);
+                }
+                case QueryTask<?> query -> query.runOn(book);
+            }
         }
+    }
+
+    /** Either a mutating {@link Task} or a read-only {@link QueryTask}, queued for this worker. */
+    sealed interface WorkItem permits Task, QueryTask {
     }
 
     /**
@@ -84,11 +107,23 @@ final class SymbolWorker {
      * exceptionally and nothing more: the exception must never escape {@link #runOn} and kill
      * the writer thread, which would silently stop this entire symbol from matching.
      */
-    record Task<T>(Command<T> command, CompletableFuture<T> future) {
+    record Task<T>(Command<T> command, CompletableFuture<T> future) implements WorkItem {
 
         void runOn(OrderBook book) {
             try {
                 future.complete(execute(command, book));
+            } catch (RuntimeException e) {
+                future.completeExceptionally(e);
+            }
+        }
+    }
+
+    /** A read-only query run against this worker's book, on its writer thread. */
+    record QueryTask<T>(Function<OrderBook, T> reader, CompletableFuture<T> future) implements WorkItem {
+
+        void runOn(OrderBook book) {
+            try {
+                future.complete(reader.apply(book));
             } catch (RuntimeException e) {
                 future.completeExceptionally(e);
             }

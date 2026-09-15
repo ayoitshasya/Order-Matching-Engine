@@ -17,7 +17,7 @@ class SymbolWorkerTest {
 
     @Test
     void offerAfterShutdownIsRejectedRatherThanQueuedBehindThePoisonPill() throws InterruptedException {
-        SymbolWorker worker = new SymbolWorker("AAPL", List.of());
+        SymbolWorker worker = new SymbolWorker("AAPL", List.of(), null);
         worker.shutdown();
         worker.awaitTermination();
 
@@ -30,7 +30,7 @@ class SymbolWorkerTest {
 
     @Test
     void shutdownIsIdempotent() throws InterruptedException {
-        SymbolWorker worker = new SymbolWorker("AAPL", List.of());
+        SymbolWorker worker = new SymbolWorker("AAPL", List.of(), null);
 
         worker.shutdown();
         worker.shutdown();

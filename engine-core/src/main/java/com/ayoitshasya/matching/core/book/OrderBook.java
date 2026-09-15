@@ -209,6 +209,35 @@ public final class OrderBook {
         return depth(asks, maxLevels);
     }
 
+    /** @return the price of the most recent trade in this book, or empty if none has occurred */
+    public OptionalLong lastTradePrice() {
+        return lastTradePrice;
+    }
+
+    /**
+     * @return every resting order in this book, bids best-to-worst price then asks
+     *         best-to-worst price, FIFO within a price level — the same order matching would
+     *         visit them in. One row per order, unlike the aggregated {@link #bidDepth} /
+     *         {@link #askDepth}; see {@link RestingOrderView} for why.
+     */
+    public List<RestingOrderView> restingOrders() {
+        List<RestingOrderView> views = new ArrayList<>(ordersById.size());
+        collectRestingOrders(bids, views);
+        collectRestingOrders(asks, views);
+        return views;
+    }
+
+    /**
+     * @return every pending stop in this book, buy stops (triggering as price rises) then sell
+     *         stops (triggering as price falls), in trigger-price then FIFO order within a price.
+     */
+    public List<PendingStopView> pendingStops() {
+        List<PendingStopView> views = new ArrayList<>(stopOrdersById.size());
+        collectPendingStops(pendingBuyStops, views);
+        collectPendingStops(pendingSellStops, views);
+        return views;
+    }
+
     private List<Trade> matchAndSettle(TradableOrder order) {
         List<Trade> trades = match(order);
         if (order.isActive() && order.getRemainingQuantity() > 0) {
@@ -378,6 +407,24 @@ public final class OrderBook {
         PriceLevel<T> level = side.get(price);
         if (level != null && level.isEmpty()) {
             side.remove(price);
+        }
+    }
+
+    private static void collectRestingOrders(TreeMap<Long, PriceLevel<LimitOrder>> side, List<RestingOrderView> out) {
+        for (PriceLevel<LimitOrder> level : side.values()) {
+            for (LimitOrder order : level.orders()) {
+                out.add(new RestingOrderView(order.getId(), order.getSide(), order.getPrice(),
+                        order.getQuantity(), order.getRemainingQuantity(), order.getSequence()));
+            }
+        }
+    }
+
+    private static void collectPendingStops(TreeMap<Long, PriceLevel<StopOrder>> side, List<PendingStopView> out) {
+        for (PriceLevel<StopOrder> level : side.values()) {
+            for (StopOrder stop : level.orders()) {
+                out.add(new PendingStopView(stop.getId(), stop.getSide(), stop.getStopPrice(),
+                        stop.getLimitPrice(), stop.getQuantity(), stop.getRemainingQuantity(), stop.getSequence()));
+            }
         }
     }
 

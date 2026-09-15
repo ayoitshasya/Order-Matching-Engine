@@ -201,3 +201,61 @@ A command submitted after shutdown has started fails its future immediately with
 `EngineShutdownException` rather than hanging — there is no window where a command is
 accepted but never actually run. See NOTES-CONCURRENCY.md for the races this had to close to
 be true.
+
+## Event Log and Replay (Phase 5)
+
+`MatchingEngine` can optionally be given an `EventLogWriter`, which appends every accepted
+command to a line-based log file. `EventLogReplayer` reads that file back and resubmits every
+command to a fresh `MatchingEngine` through its normal public API — replay is not a separate
+code path from live matching, it is the same matching logic driven by a file instead of a live
+caller.
+
+### A hand-rolled line format, not a serialization library
+
+`engine-core` carries zero runtime dependencies (see above), and the command vocabulary is small
+and fixed — four `Command` types, one of which is either a limit or a market order, another of
+which is either a plain stop or a stop-limit. `EventLogCodec` encodes each as one pipe-delimited
+line (`PLACE_LIMIT|AAPL|1|BUY|10|150|7`, and five more shapes for the rest) rather than pulling in
+a JSON or protobuf library to serialize six fixed shapes.
+
+### Logging happens on the writer thread, but never blocks it
+
+A command is logged from inside its symbol's own writer thread, at the moment that thread
+dequeues it to process it — the same single-writer-per-symbol property that keeps `OrderBook`
+lock-free (see above) also means the log for one symbol is written in exactly the order that
+symbol's commands were actually processed, with no extra synchronization needed to guarantee it.
+
+Logging itself, though, must not put disk I/O on the matching hot path. `EventLogWriter` only
+builds the line (cheap) on the caller's thread; the actual write happens on its own dedicated
+single-thread executor, the same decoupling `AsyncTradeListener` uses for listeners and for the
+same reason — a writer thread that had to wait on disk for every command would have its
+throughput bounded by disk latency instead of by matching logic.
+
+This is a durability tradeoff, not a free lunch: `append` returns before the line reaches disk,
+so a crash can lose whatever lines were still sitting in the log's own executor queue at that
+instant. Every line is still flushed individually as soon as it is written, so a crash can only
+ever cost the lines not yet handed to the OS, not anything already written — and note `flush()`
+pushes bytes out of this process's buffers, but does not `fsync`, so an OS crash or power loss
+between that flush and the OS persisting the page to physical disk is a gap this project accepts
+in exchange for keeping any disk-durability cost off the matching path entirely.
+
+### A truncated or corrupt final log line
+
+A crash mid-write is the realistic failure case for this log, and it can only ever corrupt or
+truncate the one line that was being written at the moment of the crash — every earlier line was
+already flushed in full. `EventLogReplayer` uses exactly that fact: if the *last* line in the
+file fails to decode, it is discarded with a warning and everything before it replays normally;
+if any line *other than the last* fails to decode, that is not the expected failure mode (a clean
+crash cannot corrupt a line and then keep writing valid ones after it), so replay fails loudly
+with `EventLogCorruptionException` instead of silently skipping or guessing at a log that may be
+corrupt for a reason worth investigating.
+
+### Queries are a separate, unlogged path
+
+`MatchingEngine.restingOrders`, `pendingStops`, and `lastTradePrice` (used by the replay test to
+compare a rebuilt book against the original) run a read-only function against a symbol's book on
+that symbol's own writer thread, so a query can never race a concurrent mutation. They are
+deliberately not `Command`s and are never written to the event log: a query does not change
+state, so there is nothing to replay, and logging one would only grow the file for no benefit.
+`MatchingEngine` still never exposes `OrderBook` itself to a caller — these methods return plain,
+immutable snapshots (`RestingOrderView`, `PendingStopView`).
