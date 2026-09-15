@@ -370,7 +370,54 @@ trading concurrently. These two benchmarks answer different questions (peak sing
 matching speed vs. realistic blocking-caller round-trip throughput) and neither is a ceiling or a
 floor for the other.
 
-### One hot-path optimization attempt
+### Hot-Path Optimization Attempt
 
-See [Hot-Path Optimization Attempt](#hot-path-optimization-attempt) below for the one allocation
-change attempted on `OrderBook.match()`, measured before and after, and whether it was kept.
+**The candidate.** `OrderBook.match()` used to start with `List<Trade> trades = new ArrayList<>();`
+unconditionally, on every single call — including the common case where the incoming order
+doesn't cross anything and the list stays empty for the call's entire lifetime, only to be
+returned and discarded. The change: start `trades` as `List.of()` (a shared, genuinely
+zero-allocation empty instance — not a fresh empty `ArrayList`, which the JDK already makes cheap
+but not free) and only swap in a real, mutable `ArrayList` lazily, the first time a trade actually
+occurs:
+
+```java
+List<Trade> trades = List.of();
+...
+    if (trades.isEmpty()) {
+        trades = new ArrayList<>();
+    }
+    trades.add(trade);
+```
+
+This cannot make a non-crossing submission — the majority case in a healthy two-sided book —
+allocate anything at all for its trade list, where it previously always allocated one (small)
+`ArrayList` object. A crossing order still allocates exactly the one `ArrayList` it always did,
+the first time it needs it.
+
+**Measurement.** `OrderBookThroughputBenchmark.restNonCrossingLimitOrder` — 100% non-crossing
+inserts, so it exercises exactly the path being optimized — was run before and after with a
+tighter configuration than the main results above (3 forks × (5 warmup + 5 measurement)
+iterations, to shrink the confidence interval enough to judge a change this small):
+
+| | Score | 99.9% CI |
+|---|---|---|
+| Before | 860,202 ± 208,513 ops/s | [651,689 – 1,068,715] |
+| After | 969,104 ± 153,815 ops/s | [815,289 – 1,122,919] |
+
+The point estimate moved up about 12.7%, but the two confidence intervals overlap substantially
+(roughly 815,000–1,069,000 is common ground to both) — this single comparison does not clear the
+bar for a statistically convincing win on its own; the honest read is "directionally positive,
+not conclusively proven" at this sample size, on a laptop rather than a quiet dedicated
+benchmarking host. JMH's own reminder about not over-trusting noisy numbers is the right caution
+to apply here rather than round the result up to a bigger claim than it supports.
+
+**Kept anyway, and why.** The change stayed in. Unlike an optimization whose benefit rests
+entirely on a benchmark being read correctly, this one is provably strictly less work in the
+non-crossing case — zero allocations where there used to be one — by inspection of what `List.of()`
+versus `new ArrayList<>()` actually do, independent of what any single noisy timing run shows.
+There is no code path this change makes slower: a crossing order allocates exactly as much as it
+did before, and every one of the 166 existing tests (unchanged behavior, `List<Trade>` is still
+the return type) still passes. Given a change that is mechanically an allocation reduction with
+no downside and no added complexity worth worrying about, keeping it does not require the
+throughput benchmark to have proven a large win — only that it didn't show a loss, which it
+didn't.

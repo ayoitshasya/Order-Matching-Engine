@@ -249,7 +249,11 @@ public final class OrderBook {
     }
 
     private List<Trade> match(TradableOrder incoming) {
-        List<Trade> trades = new ArrayList<>();
+        // Lazily allocated: most submissions to a healthy two-sided book rest without crossing
+        // at all, and that path should cost nothing beyond a reference assignment, not an
+        // ArrayList that is immediately discarded empty. See the README's Benchmarks section for
+        // whether this measurably helped.
+        List<Trade> trades = List.of();
         TreeMap<Long, PriceLevel<LimitOrder>> opposite = sideOf(oppositeOf(incoming.getSide()));
 
         while (incoming.getRemainingQuantity() > 0 && !opposite.isEmpty()) {
@@ -273,6 +277,9 @@ public final class OrderBook {
                 level.recordFill(matchedQuantity);
 
                 Trade trade = newTrade(incoming, resting, resting.getPrice(), matchedQuantity);
+                if (trades.isEmpty()) {
+                    trades = new ArrayList<>();
+                }
                 trades.add(trade);
                 lastTradePrice = OptionalLong.of(trade.price());
 
