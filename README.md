@@ -10,14 +10,16 @@ design, and test coverage are the priority here, not raw throughput.
 - Maven (multi-module)
 - JUnit 5 and AssertJ for testing
 - JaCoCo for coverage reporting
-- JMH for benchmarking (added in a later phase)
+- JMH for benchmarking
 - Spring Boot 3, WebSocket, and PostgreSQL (added in a later phase)
 
 ## Modules
 
-- `engine-core` — the matching engine itself: domain model, order book, and matching logic.
-  Pure Java with zero runtime dependencies; JUnit 5 and AssertJ are test-only dependencies.
-- `engine-bench` — JMH benchmarks for the matching engine (added in a later phase).
+- `engine-core` — the matching engine itself: domain model, order book, matching logic, the
+  multithreaded engine, and the event log. Pure Java with zero runtime dependencies; JUnit 5
+  and AssertJ are test-only dependencies.
+- `engine-bench` — JMH benchmarks for `OrderBook` and `MatchingEngine`. See
+  [Benchmarks](#benchmarks) below for how to run them and the last measured numbers.
 - `exchange-service` — a Spring Boot service exposing the engine over REST and WebSocket,
   backed by PostgreSQL (added in a later phase).
 
@@ -259,3 +261,116 @@ deliberately not `Command`s and are never written to the event log: a query does
 state, so there is nothing to replay, and logging one would only grow the file for no benefit.
 `MatchingEngine` still never exposes `OrderBook` itself to a caller — these methods return plain,
 immutable snapshots (`RestingOrderView`, `PendingStopView`).
+
+## Benchmarks
+
+`engine-bench` holds JMH benchmarks for both `OrderBook` (single-threaded, no queueing) and
+`MatchingEngine` (multithreaded, the full command/future/writer-thread machinery). The two are
+deliberately kept separate rather than compared as if they measured the same thing — see
+[Why the two throughput numbers aren't directly comparable](#why-the-two-throughput-numbers-arent-directly-comparable)
+below.
+
+### Running them
+
+```bash
+mvn -pl engine-bench package
+java -jar engine-bench/target/benchmarks.jar
+```
+
+`mvn package` (or `verify`) builds `engine-bench/target/benchmarks.jar`, a self-contained jar
+with JMH bundled in via the shade plugin — the standard way to run JMH under Maven. Pass a class
+name to run just one benchmark, e.g. `java -jar benchmarks.jar OrderBookThroughputBenchmark`.
+
+### Configuration
+
+Every benchmark uses the same JMH settings, set in code via annotations rather than the command
+line, so `java -jar benchmarks.jar` alone reproduces the numbers below:
+
+- 3 warmup iterations, 1 second each
+- 5 measurement iterations, 1 second each
+- 1 JVM fork
+- Throughput benchmarks report ops/s (`Mode.Throughput`); latency benchmarks report percentiles
+  in nanoseconds (`Mode.SampleTime`), which JMH computes natively for that mode
+- `MatchingEngineThroughputBenchmark` runs 4 JMH threads, one per symbol, so no two threads ever
+  contend for the same symbol's queue; every other benchmark runs single-threaded
+
+This is a deliberately quick configuration (JMH's own defaults recommend far more iterations and
+forks for publication-quality numbers) chosen to keep a full run under two and a half minutes for
+a portfolio project, at the cost of wider confidence intervals than a rigorous capacity-planning
+exercise would use — visible in the error margins below, and called out explicitly rather than
+hidden.
+
+### Machine
+
+- CPU: Intel Core i5-1135G7 (11th Gen), 4 physical cores / 8 logical processors, 2.40 GHz base
+- RAM: 16 GB
+- OS: Windows 11
+- JDK: OpenJDK 21.0.12.1 (Microsoft build), 64-bit Server VM
+- JMH: 1.37
+
+### Results (last measured 2026-09-15)
+
+**Throughput**
+
+| Benchmark | Threads | Result |
+|---|---|---|
+| `OrderBookThroughputBenchmark.restNonCrossingLimitOrder` | 1 | 838,666 ± 651,886 ops/s |
+| `MatchingEngineThroughputBenchmark.placeNonCrossingLimitOrder` | 4 (one per symbol) | 193,252 ± 32,341 ops/s |
+
+**Latency percentiles, ns/op** (`p50` / `p99` / `p99.9`)
+
+| Benchmark | depth=10 | depth=100 | depth=1000 |
+|---|---|---|---|
+| `OrderBookRestLatencyBenchmark` (rest a non-crossing order) | 400 / 3,300 / 36,160 | 500 / 2,700 / 48,475 | 400 / 2,200 / 28,412 |
+| `OrderBookMatchLatencyBenchmark` (sweep `depth` resting orders) | 600 / 2,100 / 20,288 | 3,600 / 20,480 / 172,343 | 56,640 / 184,576 / 498,999 |
+| `MatchingEngineLatencyBenchmark` (round trip, rest a non-crossing order) | 10,992 / 53,248 / 169,003 | 18,176 / 58,880 / 239,059 | 11,392 / 49,152 / 159,748 |
+
+Full output, including every percentile JMH reports (down to p99.99) and the raw histograms, is
+in `engine-bench/target/benchmark-output.log` after a run.
+
+### Reading these numbers
+
+**Resting an order barely scales with the number of price levels already in the book, in this
+range.** `OrderBookRestLatencyBenchmark`'s p50 sits at 400–500 ns whether the opposite side
+already has 10 or 1,000 distinct price levels. `TreeMap` navigation is O(log n) — at n=1,000
+that's about ten comparisons, small enough next to fixed per-call overhead and JIT/safepoint
+noise to not show up as a trend at these depths. A book with vastly more price levels (or a
+non-trivial `Comparator`) would be a different story; this one isn't at this range.
+
+**Matching a queue of resting orders scales with queue length, as expected.** Unlike resting,
+`OrderBookMatchLatencyBenchmark` walks and fills every order it sweeps — p50 latency grows
+roughly 100x from depth 10 to depth 1,000 (600 ns → 56,640 ns), consistent with the FIFO
+iteration and per-fill trade bookkeeping in `OrderBook.match()` being genuinely O(depth) work,
+not O(log depth) like a price-level lookup.
+
+**`MatchingEngine`'s round-trip latency is dominated by cross-thread handoff, not the book.**
+`MatchingEngineLatencyBenchmark` (the same non-crossing rest operation as
+`OrderBookRestLatencyBenchmark`, just through `placeOrder(...).get()`) sits at roughly
+11,000–18,000 ns at p50 — 25–40x `OrderBook`'s own 400–500 ns — and is essentially flat across
+depth, exactly like the operation it wraps. That flat ~10–20 microsecond gap is the queue
+handoff plus the caller thread parking and being woken by the writer thread once the future
+completes: a fixed per-call cost of the concurrency design, not something that grows with book
+size.
+
+#### Why the two throughput numbers aren't directly comparable
+
+`OrderBookThroughputBenchmark` (838,666 ops/s) measures pure single-threaded matching-logic
+throughput: no queue, no future, no second thread involved at all.
+`MatchingEngineThroughputBenchmark` (193,252 ops/s, on 4 threads) looks like it should be higher,
+not roughly a quarter of it — until the benchmark is read carefully: each of its 4 threads calls
+`.get()` and blocks after every single order, so its throughput is bounded by
+*(threads) / (round-trip latency)*, not by how fast a writer thread can drain its queue. At the
+~15 microsecond round-trip latency `MatchingEngineLatencyBenchmark` measured, 4 threads blocking
+serially on that latency caps out at roughly 4 / 15µs ≈ 260,000 ops/s — in the right ballpark for
+the 193,252 actually observed. A producer that pipelined requests instead of waiting for each one
+individually would be bounded by the writer thread's own drain rate instead, which — since
+draining a queue is nearly as cheap as calling `OrderBook.submit` directly — would sit much
+closer to `OrderBookThroughputBenchmark`'s number, multiplied across however many symbols are
+trading concurrently. These two benchmarks answer different questions (peak single-thread
+matching speed vs. realistic blocking-caller round-trip throughput) and neither is a ceiling or a
+floor for the other.
+
+### One hot-path optimization attempt
+
+See [Hot-Path Optimization Attempt](#hot-path-optimization-attempt) below for the one allocation
+change attempted on `OrderBook.match()`, measured before and after, and whether it was kept.

@@ -25,9 +25,11 @@
 
         <junit.version>5.11.0</junit.version>
         <assertj.version>3.26.3</assertj.version>
+        <jmh.version>1.37</jmh.version>
 
         <maven.compiler.plugin.version>3.13.0</maven.compiler.plugin.version>
         <maven.surefire.plugin.version>3.3.1</maven.surefire.plugin.version>
+        <maven.shade.plugin.version>3.5.1</maven.shade.plugin.version>
         <jacoco.plugin.version>0.8.12</jacoco.plugin.version>
     </properties>
 
